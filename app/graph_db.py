@@ -1,7 +1,7 @@
 import sqlite3
 from typing import Literal, Optional
 
-RelationshipType = Literal["Parent", "Sibling", "Spouse"]
+RelationshipType = Literal["Parent", "Sibling", "Partner"]
 
 class FamilyTree:
     def __init__(self, db_path: str):
@@ -63,44 +63,121 @@ class FamilyTree:
             self.cursor.execute("DELETE FROM people WHERE name = ?", (name,))
 
     # public relationship API
-    def add_relationship(self, type: RelationshipType, a: str, b: str):
-        # Ensure nodes exist
-        self._ensure_person_exists(a)
-        self._ensure_person_exists(b)
+    def add_relationship(self, type: RelationshipType, a, b):
+        # Normalize inputs: strings → singleton sets, iterables → sets
+        set_a = {a} if isinstance(a, str) else set(a)
+        set_b = {b} if isinstance(b, str) else set(b)
 
-        if type in ("Sibling", "Spouse"):
-            # For symmetric edges, store one row consistently: smallest name first
-            person1, person2 = sorted([a, b])
-        else:
-            # Directed relationship: keep order
-            person1, person2 = a, b
+        # Ensure all people exist
+        for person in set_a | set_b:
+            self._ensure_person_exists(person)
 
-        # Insert edge
-        self.cursor.execute("""
-            INSERT OR IGNORE INTO relationships (type, person_a, person_b)
-            VALUES (?, ?, ?)
-        """, (type, person1, person2))
+        # Cartesian product insertion
+        for pa in set_a:
+            for pb in set_b:
+                if pa == pb:
+                    raise ValueError(f"Person '{pa}' can't have a relationship with themselves.")
+                if type in ("Sibling", "Partner"):
+                    person1, person2 = sorted([pa, pb])
+                else:
+                    person1, person2 = pa, pb
 
-    def remove_relationship(self, a: str, b: str, type: Optional[RelationshipType] = None):
-        # Determine which row to remove
-        if type in ("Sibling", "Spouse"):
-            person1, person2 = sorted([a, b])
-        else:
-            person1, person2 = a, b
+                self.cursor.execute("""
+                    INSERT OR IGNORE INTO relationships (type, person_a, person_b)
+                    VALUES (?, ?, ?)
+                """, (type, person1, person2))
 
-        # Build query
-        if type:
+    def remove_relationship(self, a, b, type: Optional[RelationshipType] = None):
+        # Normalize inputs
+        set_a = {a} if isinstance(a, str) else set(a)
+        set_b = {b} if isinstance(b, str) else set(b)
+
+        for pa in set_a:
+            for pb in set_b:
+                if pa == pb:
+                    raise ValueError(f"Cannot remove a relationship of a person '{pa}' with themselves.")
+                if type in ("Sibling", "Partner"):
+                    person1, person2 = sorted([pa, pb])
+                else:
+                    person1, person2 = pa, pb
+
+                if type:
+                    self.cursor.execute("""
+                        DELETE FROM relationships
+                        WHERE type = ? AND person_a = ? AND person_b = ?
+                    """, (type, person1, person2))
+                else:
+                    # delete all relationship types between these two
+                    self.cursor.execute("""
+                        DELETE FROM relationships
+                        WHERE (person_a = ? AND person_b = ?) OR (person_a = ? AND person_b = ?)
+                    """, (person1, person2, person2, person1))
+
+                # Prune lonely nodes
+                self._delete_person_if_lonely(pa)
+                self._delete_person_if_lonely(pb)
+
+    # query helpers
+    def parents_of(self, person: str | set[str]) -> dict[str, set[str]]:
+        set_people = {person} if isinstance(person, str) else set(person)
+        relationship_mapping: dict[str, set[str]] = {}
+        for person in set_people:
             self.cursor.execute("""
-                DELETE FROM relationships
-                WHERE type = ? AND person_a = ? AND person_b = ?
-            """, (type, person1, person2))
-        else:
-            # Delete all types between these two
-            self.cursor.execute("""
-                DELETE FROM relationships
-                WHERE (person_a = ? AND person_b = ?) OR (person_a = ? AND person_b = ?)
-            """, (person1, person2, person2, person1))
+                SELECT person_a FROM relationships
+                WHERE type = 'Parent' AND person_b = ?
+            """, (person,))
+            relationship_mapping[person] = {row[0] for row in self.cursor.fetchall()}
+        return relationship_mapping
 
-        # Prune lonely nodes
-        self._delete_person_if_lonely(a)
-        self._delete_person_if_lonely(b)
+    def children_of(self, person: str | set[str]) -> dict[str, set[str]]:
+        set_people = {person} if isinstance(person, str) else set(person)
+        relationship_mapping: dict[str, set[str]] = {}
+        for person in set_people:
+            self.cursor.execute("""
+                SELECT person_b FROM relationships
+                WHERE type = 'Parent' AND person_a = ?
+            """, (person,))
+            relationship_mapping[person] = {row[0] for row in self.cursor.fetchall()}
+        return relationship_mapping
+
+    def siblings_of(self, person: str | set[str]) -> dict[str, set[str]]:
+        set_people = {person} if isinstance(person, str) else set(person)
+        relationship_mapping: dict[str, set[str]] = {}
+
+        for p in set_people:
+            self.cursor.execute("""
+                SELECT person_a, person_b
+                FROM relationships
+                WHERE type = 'Sibling' AND (person_a = ? OR person_b = ?)
+            """, (p, p))
+
+            rows = self.cursor.fetchall()
+            result = set()
+
+            for a, b in rows:
+                result.add(b if a == p else a)
+
+            relationship_mapping[p] = result
+
+        return relationship_mapping
+
+    def partner_of(self, person: str | set[str]) -> dict[str, set[str]]:
+        set_people = {person} if isinstance(person, str) else set(person)
+        relationship_mapping: dict[str, set[str]] = {}
+
+        for p in set_people:
+            self.cursor.execute("""
+                SELECT person_a, person_b
+                FROM relationships
+                WHERE type = 'Partner' AND (person_a = ? OR person_b = ?)
+            """, (p, p))
+
+            rows = self.cursor.fetchall()
+            result = set()
+
+            for a, b in rows:
+                result.add(b if a == p else a)
+
+            relationship_mapping[p] = result
+
+        return relationship_mapping
